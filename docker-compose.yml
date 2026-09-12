@@ -1,0 +1,288 @@
+name: tracelens
+
+x-demo-environment: &demo-environment
+  ENVIRONMENT: local
+  OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4318
+  NATS_URL: nats://nats:4222
+  SIMULATOR_ENABLED: "true"
+
+x-python-service: &python-service
+  image: tracelens-python:local
+  build:
+    context: .
+    dockerfile: infra/docker/python.Dockerfile
+  restart: unless-stopped
+  networks: [tracelens]
+  depends_on:
+    otel-collector:
+      condition: service_started
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-tracelens}
+      POSTGRES_USER: ${POSTGRES_USER:-tracelens}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-change-me-locally}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: [CMD-SHELL, "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    networks: [tracelens]
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: [redis-server, --appendonly, "yes", --maxmemory, 128mb, --maxmemory-policy, allkeys-lru]
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: [CMD, redis-cli, ping]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    networks: [tracelens]
+
+  nats:
+    image: nats:2.11-alpine
+    restart: unless-stopped
+    command: [-js, -sd, /data, -m, "8222"]
+    volumes:
+      - nats-data:/data
+    ports:
+      - "127.0.0.1:8222:8222"
+    networks: [tracelens]
+
+  prometheus:
+    image: tracelens-prometheus:local
+    build:
+      context: .
+      dockerfile: infra/docker/observability.Dockerfile
+      target: prometheus
+    restart: unless-stopped
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=2h
+      - --storage.tsdb.retention.size=1GB
+    volumes:
+      - prometheus-data:/prometheus
+    ports:
+      - "127.0.0.1:9090:9090"
+    networks: [tracelens]
+
+  tempo:
+    image: tracelens-tempo:local
+    build:
+      context: .
+      dockerfile: infra/docker/observability.Dockerfile
+      target: tempo
+    restart: unless-stopped
+    command: [-config.file=/etc/tempo.yaml]
+    volumes:
+      - tempo-data:/var/tempo
+    networks: [tracelens]
+
+  loki:
+    image: tracelens-loki:local
+    build:
+      context: .
+      dockerfile: infra/docker/observability.Dockerfile
+      target: loki
+    restart: unless-stopped
+    command: [-config.file=/etc/loki/local-config.yaml]
+    volumes:
+      - loki-data:/loki
+    networks: [tracelens]
+
+  grafana:
+    image: tracelens-grafana:local
+    build:
+      context: .
+      dockerfile: infra/docker/observability.Dockerfile
+      target: grafana
+    restart: unless-stopped
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+    volumes:
+      - grafana-data:/var/lib/grafana
+    ports:
+      - "127.0.0.1:3001:3000"
+    depends_on: [prometheus, tempo, loki]
+    networks: [tracelens]
+
+  otel-collector:
+    image: tracelens-otel-collector:local
+    build:
+      context: .
+      dockerfile: infra/docker/observability.Dockerfile
+      target: otel-collector
+    restart: unless-stopped
+    command: [--config=/etc/otelcol-contrib/config.yaml]
+    depends_on: [tempo, loki]
+    networks: [tracelens]
+
+  inventory:
+    <<: *python-service
+    command: [python, -m, uvicorn, services.inventory.main:app, --host, 0.0.0.0, --port, "8000"]
+    environment:
+      <<: *demo-environment
+      SERVICE_NAME: inventory
+    ports:
+      - "127.0.0.1:8002:8000"
+
+  payment:
+    <<: *python-service
+    command: [python, -m, uvicorn, services.payment.main:app, --host, 0.0.0.0, --port, "8000"]
+    environment:
+      <<: *demo-environment
+      SERVICE_NAME: payment
+    ports:
+      - "127.0.0.1:8003:8000"
+
+  notification:
+    <<: *python-service
+    command: [python, -m, uvicorn, services.notification.main:app, --host, 0.0.0.0, --port, "8000"]
+    environment:
+      <<: *demo-environment
+      SERVICE_NAME: notification
+    depends_on:
+      otel-collector:
+        condition: service_started
+      nats:
+        condition: service_started
+    ports:
+      - "127.0.0.1:8004:8000"
+
+  order:
+    <<: *python-service
+    command: [python, -m, uvicorn, services.order.main:app, --host, 0.0.0.0, --port, "8000"]
+    environment:
+      <<: *demo-environment
+      SERVICE_NAME: order
+      INVENTORY_URL: http://inventory:8000
+      PAYMENT_URL: http://payment:8000
+    depends_on:
+      inventory:
+        condition: service_started
+      payment:
+        condition: service_started
+      nats:
+        condition: service_started
+      otel-collector:
+        condition: service_started
+    ports:
+      - "127.0.0.1:8001:8000"
+
+  gateway:
+    <<: *python-service
+    command: [python, -m, uvicorn, services.gateway.main:app, --host, 0.0.0.0, --port, "8000"]
+    environment:
+      <<: *demo-environment
+      SERVICE_NAME: gateway
+      ORDER_URL: http://order:8000
+    depends_on:
+      order:
+        condition: service_started
+      otel-collector:
+        condition: service_started
+    ports:
+      - "127.0.0.1:8000:8000"
+
+  traffic-generator:
+    <<: *python-service
+    command: [python, -m, uvicorn, services.traffic_generator.main:app, --host, 0.0.0.0, --port, "8000"]
+    environment:
+      <<: *demo-environment
+      SERVICE_NAME: traffic-generator
+      GATEWAY_URL: http://gateway:8000
+      TRAFFIC_RPS: "2.0"
+    depends_on:
+      gateway:
+        condition: service_started
+      otel-collector:
+        condition: service_started
+    ports:
+      - "127.0.0.1:8005:8000"
+
+  tracelens-api:
+    <<: *python-service
+    command: [sh, -c, "alembic -c apps/tracelens_api/alembic.ini upgrade head && python -m uvicorn tracelens.main:app --host 0.0.0.0 --port 8080"]
+    environment:
+      <<: *demo-environment
+      SERVICE_NAME: tracelens-api
+      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-tracelens}:${POSTGRES_PASSWORD:-change-me-locally}@postgres:5432/${POSTGRES_DB:-tracelens}
+      REDIS_URL: redis://redis:6379/0
+      PROMETHEUS_URL: http://prometheus:9090
+      AI_PROVIDER: ${AI_PROVIDER:-disabled}
+      AI_BASE_URL: ${AI_BASE_URL:-}
+      AI_API_KEY: ${AI_API_KEY:-}
+      AI_MODEL: ${AI_MODEL:-}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      prometheus:
+        condition: service_started
+      otel-collector:
+        condition: service_started
+    ports:
+      - "127.0.0.1:8080:8080"
+    healthcheck:
+      test: [CMD, python, -c, "import urllib.request; urllib.request.urlopen('http://localhost:8080/ready', timeout=2)"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+
+  analyzer:
+    <<: *python-service
+    command: [python, -m, tracelens.workers.analyzer]
+    environment:
+      <<: *demo-environment
+      SERVICE_NAME: tracelens-analyzer
+      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-tracelens}:${POSTGRES_PASSWORD:-change-me-locally}@postgres:5432/${POSTGRES_DB:-tracelens}
+      REDIS_URL: redis://redis:6379/0
+      PROMETHEUS_URL: http://prometheus:9090
+      ANALYSIS_INTERVAL_SECONDS: "10"
+    depends_on:
+      tracelens-api:
+        condition: service_healthy
+
+  web:
+    image: tracelens-web:local
+    build:
+      context: .
+      dockerfile: infra/docker/web.Dockerfile
+      args:
+        NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://localhost:8080}
+    restart: unless-stopped
+    environment:
+      NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://localhost:8080}
+    depends_on:
+      tracelens-api:
+        condition: service_started
+    ports:
+      - "127.0.0.1:3000:3000"
+    networks: [tracelens]
+
+networks:
+  tracelens:
+    name: tracelens-network
+
+volumes:
+  postgres-data:
+  redis-data:
+  nats-data:
+  prometheus-data:
+  tempo-data:
+  loki-data:
+  grafana-data:
