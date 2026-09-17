@@ -123,8 +123,6 @@ The fault control is simulated. The service calls, timeouts, metrics, logs, span
 .\scripts\windows\Reset-TraceLens.ps1 -ConfirmReset
 ```
 
-When you want to play Valorant, stop TraceLens, shut down Windows, and choose **Windows 10 - Valorant Mode** at boot. Docker requires your separate Docker Mode because its Linux container engine needs the Windows hypervisor.
-
 ## Detection and root-cause method
 
 Every 10 seconds the analyzer queries one-minute Prometheus windows and produces a normalized signal snapshot:
@@ -160,18 +158,6 @@ docs                        Architecture, demo, decisions, and interview notes
 docker-compose.yml          Complete local environment
 ```
 
-## Optional AI explanation
-
-Leave `AI_PROVIDER=disabled` for the deterministic explanation. To use an OpenAI-compatible chat endpoint, edit `.env`:
-
-```dotenv
-AI_PROVIDER=openai-compatible
-AI_BASE_URL=https://your-provider.example/v1
-AI_API_KEY=replace-locally
-AI_MODEL=your-model
-```
-
-The model receives a structured evidence pack and ranked hypotheses. Provider failure falls back to the deterministic explanation. Never commit `.env`.
 
 ## Resource and retention choices
 
